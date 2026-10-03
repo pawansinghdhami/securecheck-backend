@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query, HTTPException
+from datetime import datetime, timedelta
 from database import SessionLocal
 from models import Scan, Finding
 from scanners.https import check_https
@@ -9,6 +10,10 @@ from services.summary import build_summary
 from services.comparison import compare_scans
 from scanners.cookies import check_cookie_security
 from fastapi.middleware.cors import CORSMiddleware
+from urllib.parse import urlparse
+from scanners.reachability import check_domain_reachability
+from services.scan_deduplication import generate_scan_fingerprint
+from sqlalchemy import String, Integer, DateTime, ForeignKey, func
 
 app = FastAPI(title="SecureCheck API")
 
@@ -22,6 +27,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+def normalize_domain(domain: str) -> str:
+    domain = domain.strip().lower()
+
+    if not domain:
+        raise ValueError("Domain is required")
+
+    if not domain.startswith(("http://", "https://")):
+        domain = "https://" + domain
+
+    parsed = urlparse(domain)
+
+    hostname = parsed.hostname
+
+    if not hostname:
+        raise ValueError("Invalid domain")
+
+    return hostname.rstrip(".")
 
 @app.get("/health")
 def health_check():
@@ -39,11 +62,73 @@ def security_headers_endpoint(domain: str):
     return check_security_headers(domain)
    
 @app.post("/scan")
-def run_scan(domain:str):
+def run_scan(domain: str):
+    try:
+        domain = normalize_domain(domain)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
+
+    reachability_result = check_domain_reachability(domain)
+
+    if not reachability_result["reachable"]:
+        return {
+            "domain": domain,
+            "status": "FAILED",
+            "security_score": None,
+            "stage": reachability_result["stage"],
+            "ip_address": reachability_result["ip_address"],
+            "status_code": reachability_result["status_code"],
+            "final_url": reachability_result["final_url"],
+            "error": reachability_result["error"]
+        }
+
+    # Run scanners
     https_result = check_https(domain)
     headers_result = check_security_headers(domain)
     cookies_result = check_cookie_security(domain)
 
+    # Generate fingerprint
+    result_fingerprint = generate_scan_fingerprint(
+        https_result,
+        headers_result,
+        cookies_result
+    )
+
+    # Check latest scan for this domain
+    db = SessionLocal()
+
+    try:
+        latest_scan = (
+            db.query(Scan)
+            .filter(Scan.domain == domain)
+            .order_by(
+                Scan.created_dtm.desc(),
+                Scan.id.desc()
+            )
+            .first()
+        )
+
+        # Same day + same result = duplicate
+        if (
+            latest_scan
+            and latest_scan.created_dtm.date() == datetime.now().date()
+            and latest_scan.result_fingerprint == result_fingerprint
+        ):
+            return {
+                "id": latest_scan.id,
+                "domain": latest_scan.domain,
+                "status": latest_scan.status,
+                "security_score": latest_scan.security_score,
+                "message": "No changes detected since the previous scan."
+            }
+
+    finally:
+        db.close()
+
+    # Build findings
     findings = build_findings(
         https_result,
         headers_result,
@@ -53,43 +138,48 @@ def run_scan(domain:str):
     security_score = calculate_security_score(findings)
     summary = build_summary(findings)
 
-    #Database connection
+    # Save scan
     db = SessionLocal()
-
     try:
         scan = Scan(
-            domain=domain,
-            status="COMPLETED",
-            security_score=security_score
+        domain=domain,
+        status="COMPLETED",
+        security_score=security_score,
+        result_fingerprint=result_fingerprint
         )
         db.add(scan)
         db.commit()
         db.refresh(scan)
-    finally:
-            db.close()
 
-    #save findings 
-    for finding_data in findings:
-        finding = Finding(
-            scan_id = scan.id,
-            finding_code=finding_data["code"],
-            title = finding_data["title"],
-            severity = finding_data["severity"],
-            status = finding_data["status"],
-            description = finding_data["description"],
-            recommendation = finding_data["recommendation"],
-            evidence=finding_data.get("evidence")
-        )        
+        scan_id = scan.id
+
+        # Save findings
+        for finding_data in findings:
+            finding = Finding(
+                scan_id=scan_id,
+                finding_code=finding_data["code"],
+                title=finding_data["title"],
+                severity=finding_data["severity"],
+                status=finding_data["status"],
+                description=finding_data["description"],
+                recommendation=finding_data["recommendation"],
+                evidence=finding_data.get("evidence")
+            )
+
         db.add(finding)
-    db.commit()
 
+        db.commit()
+        
+    finally:
+        db.close()
+        
     return {
-        "id": scan.id,
-        "domain" : domain,
-        "status" : "COMPLETED",
-        "security_score" : security_score,
-        "summary" : summary,
-        "findings" : findings
+        "id": scan_id,
+        "domain": domain,
+        "status": "COMPLETED",
+        "security_score": security_score,
+        "summary": summary,
+        "findings": findings
     }
 
 @app.get("/scans/{domain}")
@@ -171,25 +261,38 @@ def cookie_security_endpoint(domain: str):
     return check_cookie_security(domain)
 
 @app.get("/dashboard")
-def get_dashboard():
+def get_dashboard(
+    domain: str | None = Query(default=None),
+    days: int | None = Query(default=None, ge=1)
+):
     db = SessionLocal()
 
     try:
-        # Total scans
-        total_scans = db.query(Scan).count()
+        # Base query
+        query = db.query(Scan)
 
-        # Latest scan
+        # Apply filters first
+        if domain:
+            query = query.filter(Scan.domain == domain)
+
+        if days:
+            start_date = datetime.now() - timedelta(days=days)
+            query = query.filter(Scan.created_dtm >= start_date)
+
+        # Filtered total
+        total_scans = query.count()
+
+        # Filtered latest scan
         latest_scan = (
-            db.query(Scan)
+            query
             .order_by(Scan.created_dtm.desc(), Scan.id.desc())
             .first()
         )
 
-        # Last 10 scans
+        # Filtered scans
         scans = (
-            db.query(Scan)
+            query
             .order_by(Scan.created_dtm.desc(), Scan.id.desc())
-            .limit(10)
             .all()
         )
 
@@ -250,6 +353,8 @@ def get_dashboard():
             }
 
         # Domain statistics
+        # Keep this unfiltered so frontend can populate
+        # the domain dropdown with all available domains.
         all_scans = (
             db.query(Scan)
             .order_by(Scan.created_dtm.desc(), Scan.id.desc())

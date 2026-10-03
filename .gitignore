@@ -1,0 +1,54 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Test, type-checker, and linter output
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Local databases and generated output
+*.sqlite
+*.sqlite3
+*.db
+/securecheck_report.pdf
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

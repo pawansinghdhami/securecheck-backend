@@ -25,8 +25,12 @@ class Scan(Base):
     )
     created_dtm: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.now(),
+        default=datetime.now,
         nullable=False
+    )
+    result_fingerprint: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True
     )
     findings: Mapped[list["Finding"]] = relationship(
         back_populates="scan",
@@ -70,6 +74,11 @@ class Finding(Base):
     )
     evidence: Mapped[dict | None] = mapped_column(
         JSONB,
+        nullable=True
+    )
+    created_dtm: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.now,
         nullable=True
     )
     scan: Mapped["Scan"] = relationship(

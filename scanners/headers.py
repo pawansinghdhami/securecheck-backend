@@ -1,5 +1,5 @@
 import requests
-
+from scanners.http_client import get
 
 SECURITY_HEADERS = {
     "Strict-Transport-Security": {
@@ -26,10 +26,9 @@ def check_security_headers(domain: str):
     url = f"https://{domain}"
 
     try:
-        response = requests.get(
+        response = get(
             url,
-            timeout=10,
-            allow_redirects=True
+            timeout=10
         )
 
         results = []
