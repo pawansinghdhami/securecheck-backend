@@ -169,3 +169,115 @@ def compare_scan(scan_id: int):
 @app.get("/check/cookies")
 def cookie_security_endpoint(domain: str):
     return check_cookie_security(domain)
+
+@app.get("/dashboard")
+def get_dashboard():
+    db = SessionLocal()
+
+    try:
+        # Total scans
+        total_scans = db.query(Scan).count()
+
+        # Latest scan
+        latest_scan = (
+            db.query(Scan)
+            .order_by(Scan.created_dtm.desc(), Scan.id.desc())
+            .first()
+        )
+
+        # Last 10 scans
+        scans = (
+            db.query(Scan)
+            .order_by(Scan.created_dtm.desc(), Scan.id.desc())
+            .limit(10)
+            .all()
+        )
+
+        # Scan history
+        scan_history = [
+            {
+                "id": scan.id,
+                "domain": scan.domain,
+                "security_score": scan.security_score,
+                "status": scan.status,
+                "created_dtm": scan.created_dtm
+            }
+            for scan in scans
+        ]
+
+        # Score trend
+        score_trend = [
+            {
+                "id": scan.id,
+                "domain": scan.domain,
+                "score": scan.security_score,
+                "created_dtm": scan.created_dtm
+            }
+            for scan in reversed(scans)
+        ]
+
+        # Latest scan summary
+        summary = {
+            "critical": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0
+        }
+
+        if latest_scan:
+            latest_findings = (
+                db.query(Finding)
+                .filter(Finding.scan_id == latest_scan.id)
+                .all()
+            )
+
+            for finding in latest_findings:
+                severity = finding.severity.lower()
+
+                if severity in summary:
+                    summary[severity] += 1
+
+        # Latest scan data
+        latest_scan_data = None
+
+        if latest_scan:
+            latest_scan_data = {
+                "id": latest_scan.id,
+                "domain": latest_scan.domain,
+                "security_score": latest_scan.security_score,
+                "status": latest_scan.status,
+                "created_dtm": latest_scan.created_dtm
+            }
+
+        # Domain statistics
+        all_scans = (
+            db.query(Scan)
+            .order_by(Scan.created_dtm.desc(), Scan.id.desc())
+            .all()
+        )
+
+        domain_data = {}
+
+        for scan in all_scans:
+            if scan.domain not in domain_data:
+                domain_data[scan.domain] = {
+                    "domain": scan.domain,
+                    "latest_score": scan.security_score,
+                    "scan_count": 0
+                }
+
+            domain_data[scan.domain]["scan_count"] += 1
+
+        domains = list(domain_data.values())
+
+        return {
+            "total_scans": total_scans,
+            "latest_scan": latest_scan_data,
+            "summary": summary,
+            "scan_history": scan_history,
+            "score_trend": score_trend,
+            "domains": domains
+        }
+
+    finally:
+        db.close()
