@@ -32,6 +32,10 @@ class Scan(Base):
         String(64),
         nullable=True
     )
+    canonical_domain: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True
+    )
     findings: Mapped[list["Finding"]] = relationship(
         back_populates="scan",
         cascade="all, delete-orphan"

@@ -90,6 +90,22 @@ def run_scan(domain: str):
     headers_result = check_security_headers(domain)
     cookies_result = check_cookie_security(domain)
 
+    canonical_domain = domain
+
+    final_url = https_result.get("evidence", {}).get("final_url")
+
+    if final_url:
+        parsed_final_url = urlparse(final_url)
+        
+        if parsed_final_url.hostname:
+            canonical_domain = parsed_final_url.hostname.lower().rstrip(".")
+
+    print(
+    f"requested={domain}, "
+    f"final_url={final_url}, "
+    f"canonical={canonical_domain}"
+    )   
+
     # Generate fingerprint
     result_fingerprint = generate_scan_fingerprint(
         https_result,
@@ -103,7 +119,7 @@ def run_scan(domain: str):
     try:
         latest_scan = (
             db.query(Scan)
-            .filter(Scan.domain == domain)
+            .filter(Scan.canonical_domain == canonical_domain)
             .order_by(
                 Scan.created_dtm.desc(),
                 Scan.id.desc()
@@ -145,7 +161,8 @@ def run_scan(domain: str):
         domain=domain,
         status="COMPLETED",
         security_score=security_score,
-        result_fingerprint=result_fingerprint
+        result_fingerprint=result_fingerprint,
+        canonical_domain=canonical_domain,
         )
         db.add(scan)
         db.commit()
@@ -166,8 +183,7 @@ def run_scan(domain: str):
                 evidence=finding_data.get("evidence")
             )
 
-        db.add(finding)
-
+            db.add(finding)
         db.commit()
         
     finally:
