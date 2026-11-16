@@ -1,7 +1,14 @@
-from fastapi import FastAPI, Query, HTTPException
+import ipaddress
+import hashlib
+import os
+import re
+import secrets
+from fastapi import Cookie, Depends, FastAPI, Query, HTTPException, Response
 from datetime import datetime, timedelta
+from pydantic import BaseModel
 from database import SessionLocal
-from models import Scan, Finding
+from models import AuthSession, Scan, Finding, User
+from services.passwords import hash_password, verify_password
 from scanners.https import check_https
 from scanners.headers import check_security_headers
 from services.findings import build_findings
@@ -14,6 +21,7 @@ from urllib.parse import urlparse
 from scanners.reachability import check_domain_reachability
 from services.scan_deduplication import generate_scan_fingerprint
 from sqlalchemy import String, Integer, DateTime, ForeignKey, func
+from sqlalchemy.exc import IntegrityError
 
 app = FastAPI(title="SecureCheck API")
 
@@ -28,6 +36,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class SignupPayload(BaseModel):
+    full_name: str
+    email: str
+    password: str
+
+class LoginPayload(BaseModel):
+    email: str
+    password: str
+    remember_me: bool = False
+
 def normalize_domain(domain: str) -> str:
     domain = domain.strip().lower()
 
@@ -38,13 +56,34 @@ def normalize_domain(domain: str) -> str:
         domain = "https://" + domain
 
     parsed = urlparse(domain)
-
     hostname = parsed.hostname
 
     if not hostname:
         raise ValueError("Invalid domain")
 
-    return hostname.rstrip(".")
+    hostname = hostname.rstrip(".")
+
+    if hostname in {"localhost"} or hostname.endswith(".localhost"):
+        raise ValueError("Localhost and local development domains are not allowed")
+
+    if hostname.endswith(".local") or hostname.endswith(".internal"):
+        raise ValueError("Private or internal domains are not allowed")
+
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        ip = None
+
+    if ip is not None and (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+    ):
+        raise ValueError("Private, loopback, or reserved IP addresses are not allowed")
+
+    return hostname
 
 @app.get("/health")
 def health_check():
@@ -52,6 +91,100 @@ def health_check():
         "status" : "ok",
         "service" : "SecureCheck"
     }
+
+@app.post("/auth/signup", status_code=201)
+def signup(payload: SignupPayload):
+    full_name = payload.full_name.strip()
+    email = payload.email.strip().lower()
+
+    if not full_name or len(full_name) > 120:
+        raise HTTPException(status_code=422, detail="Enter a name up to 120 characters.")
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(email) > 254:
+        raise HTTPException(status_code=422, detail="Enter a valid email address.")
+    if len(payload.password) < 8 or len(payload.password) > 128:
+        raise HTTPException(status_code=422, detail="Password must be 8 to 128 characters long.")
+
+    db = SessionLocal()
+    try:
+        if db.query(User.id).filter(User.email == email).first():
+            raise HTTPException(status_code=409, detail="An account with this email already exists.")
+
+        user = User(
+            full_name=full_name,
+            email=email,
+            password_hash=hash_password(payload.password),
+        )
+        db.add(user)
+
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="An account with this email already exists.")
+
+        db.refresh(user)
+        return {
+            "id": user.id,
+            "full_name": user.full_name,
+            "email": user.email,
+            "created_dtm": user.created_dtm,
+        }
+    finally:
+        db.close()
+
+@app.post("/auth/login")
+def login(payload: LoginPayload, response: Response):
+    email = payload.email.strip().lower()
+    db = SessionLocal()
+
+    try:
+        user = db.query(User).filter(User.email == email).first()
+        if not user or not verify_password(payload.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+        session_token = secrets.token_urlsafe(32)
+        lifetime = timedelta(days=30) if payload.remember_me else timedelta(hours=12)
+        db.add(AuthSession(
+            user_id=user.id,
+            token_hash=hashlib.sha256(session_token.encode("utf-8")).hexdigest(),
+            expires_dtm=datetime.now() + lifetime,
+        ))
+        db.commit()
+
+        response.set_cookie(
+            key="vigilez_session",
+            value=session_token,
+            max_age=int(lifetime.total_seconds()) if payload.remember_me else None,
+            httponly=True,
+            secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
+            samesite="lax",
+            path="/",
+        )
+        return {"id": user.id, "full_name": user.full_name, "email": user.email}
+    finally:
+        db.close()
+
+def require_current_user(vigilez_session: str | None = Cookie(default=None)) -> User:
+    if not vigilez_session:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+
+    token_hash = hashlib.sha256(vigilez_session.encode("utf-8")).hexdigest()
+    db = SessionLocal()
+    try:
+        auth_session = (
+            db.query(AuthSession)
+            .filter(AuthSession.token_hash == token_hash)
+            .first()
+        )
+        if not auth_session or auth_session.expires_dtm <= datetime.now():
+            raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+
+        user = db.query(User).filter(User.id == auth_session.user_id).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="Authentication required.")
+        return user
+    finally:
+        db.close()
 
 @app.get("/check/https")
 def https_check_endpoint(domain: str):
@@ -131,13 +264,35 @@ def run_scan(domain: str):
         if (
             latest_scan
             and latest_scan.created_dtm.date() == datetime.now().date()
-            and latest_scan.result_fingerprint == result_fingerprint
-        ):
+            and latest_scan.result_fingerprint == result_fingerprint):
+            
+            existing_findings = (
+                db.query(Finding)
+                .filter(Finding.scan_id == latest_scan.id)
+                .all()
+            )
+            existing_findings_data = [
+                {
+                    "code": finding.finding_code,
+                    "title": finding.title,
+                    "severity": finding.severity,
+                    "status": finding.status,
+                    "description": finding.description,
+                    "recommendation": finding.recommendation,
+                    "evidence": finding.evidence
+                }
+            for finding in existing_findings
+            ]
+
+            existing_summary = build_summary(existing_findings_data)
+
             return {
                 "id": latest_scan.id,
                 "domain": latest_scan.domain,
                 "status": latest_scan.status,
                 "security_score": latest_scan.security_score,
+                "summary": existing_summary,
+                "findings": existing_findings_data,
                 "message": "No changes detected since the previous scan."
             }
 
@@ -276,7 +431,7 @@ def compare_scan(scan_id: int):
 def cookie_security_endpoint(domain: str):
     return check_cookie_security(domain)
 
-@app.get("/dashboard")
+@app.get("/dashboard", dependencies=[Depends(require_current_user)])
 def get_dashboard(
     domain: str | None = Query(default=None),
     days: int | None = Query(default=None, ge=1)

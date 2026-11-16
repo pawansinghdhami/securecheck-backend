@@ -4,6 +4,55 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from database import Base
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(
+        Integer, 
+        primary_key=True,
+        autoincrement=True
+    )
+    full_name: Mapped[str] = mapped_column(
+        String(120),
+        nullable=False
+    )
+    email: Mapped[str] = mapped_column(
+        String(254),
+        unique=True,
+        index=True,
+        nullable=False
+    )
+    password_hash: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False
+    )
+    created_dtm: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.now,
+        nullable=False
+    )
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(
+        String(64),
+        unique=True,
+        index=True,
+        nullable=False
+    )
+    expires_dtm: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_dtm: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.now,
+        nullable=False
+    )
+
 class Scan(Base):
     __tablename__="scans"
 
