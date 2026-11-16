@@ -1,5 +1,5 @@
 from database import engine, Base
-from models import Scan, Finding
+from models import Scan, Finding, User, AuthSession
 
 print("Creating database tables...")
 

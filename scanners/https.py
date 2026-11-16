@@ -1,14 +1,14 @@
 import requests
+from scanners.http_client import get
 
 def check_https(domain: str):
 
     url = f"https://{domain}"
 
     try:
-        response = requests.get(
+        response = get(
             url,
-            timeout=10,
-            allow_redirects=True
+            timeout=10
         )
 
         return {
